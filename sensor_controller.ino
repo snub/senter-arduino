@@ -1,22 +1,24 @@
-#include <aJSON.h>
-#include <Time.h> 
+#include <DallasTemperature.h>
+#include <Dns.h>
 #include <Ethernet.h>
 #include <EthernetUdp.h>
-#include <SPI.h>
-#include <PubSubClient.h>
 #include <OneWire.h>
-#include <DallasTemperature.h>
+#include <PubSubClient.h>
+#include <SPI.h>
+#include <Time.h>
+
+//#define MY_DEBUG
+
+#define CMD_GET_IP 1
+#define CMD_SET_IP 2
+#define CMD_GET_UPDATE_INTERVAL 3
+#define CMD_SET_UPDATE_INTERVAL 4
+#define CMD_GET_NTP_SERVER 5
+#define CMD_SET_NTP_SERVER 6
+
+#define DEFAULT_UPDATE_INTERVAL 60
 
 #define ONE_WIRE_BUS 2
-//#define TEMPERATURE_PRECISION 9
-#define UPDATE_INTERVAL 60
-
-// Callback function header
-void callback(char* topic, byte* payload, unsigned int length);
-String byteArrayToHexStr(byte* a, int len);
-void pubMsg(String topic, String msg);
-void subTopic(String topic);
-String deviceAddressToStr(DeviceAddress deviceAddress);
 
 // Setup a oneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
 OneWire oneWire(ONE_WIRE_BUS);
@@ -36,7 +38,7 @@ String hexMac = byteArrayToHexStr(mac, 6);
 byte mqttServer[] = { 192, 168, 1, 100 };
 
 // NTP server
-IPAddress timeServer(195, 80, 105, 226);
+IPAddress timeServer(195, 80, 123, 154);
 
 // Time Zone UTC
 const byte timeZone = 0;
@@ -52,127 +54,149 @@ byte packetBuffer[NTP_PACKET_SIZE];
 EthernetClient ethClient;
 PubSubClient mqttClient(mqttServer, 1883, callback, ethClient);
 
+int updateInterval = DEFAULT_UPDATE_INTERVAL;
+
 void setup() {
-  Serial.begin(9600);
-  while (!Serial) ; // Needed for Leonardo only
-  delay(250);
-  
-  Serial.println("sensor controller: " + hexMac);
-  
-  // ethernet
-  if (Ethernet.begin(mac) == 0) {
-    // no point in carrying on, so do nothing forevermore:
-    while (1) {
-      Serial.println("failed to configure Ethernet using DHCP");
-      delay(10000);
+    Serial.begin(9600);
+    while (!Serial) ; // Needed for Leonardo only
+    delay(250);
+
+    #if defined(MY_DEBUG)
+    Serial.println("sensor controller: " + hexMac);
+    #endif
+
+    if (Ethernet.begin(mac) == 0) {
+        // no point in carrying on, so do nothing forevermore:
+        while (1) {
+            Serial.println("failed to configure Ethernet using DHCP");
+            delay(10000);
+        }
     }
-  }
-  
-  Serial.print(" ip: ");
-  Serial.println(Ethernet.localIP());
 
-  // udp and ntp
-  Udp.begin(localPort);
-  Serial.println("ntp sync");
-  setSyncProvider(getNtpTime);
+    #if defined(MY_DEBUG)
+    Serial.print(" ip: ");
+    Serial.println(Ethernet.localIP());
+    #endif
 
-  // mqtt
-  String clientId = "sc" + hexMac;
-  int clientIdLen = clientId.length() + 1;
-  char clientIdArray[clientIdLen];
-  clientId.toCharArray(clientIdArray, clientIdLen);
-  
-  if (!mqttClient.connect(clientIdArray)) {
-    // no point in carrying on, so do nothing forevermore:
-    while (1) {
-      Serial.println("failed to connect MQTT server");
-      delay(10000);
+    // udp and ntp
+    Udp.begin(localPort);
+    #if defined(MY_DEBUG)
+    Serial.println("ntp sync");
+    #endif
+    setSyncProvider(getNtpTime);
+
+    startMqtt();
+
+    String helloTopic = "/controller/" + hexMac + "/hello";
+
+    char buffer[11];
+    memset(buffer,'\0',11);
+    ultoa((unsigned long)now(), buffer, 10);
+
+    pubMsg(helloTopic, buffer);
+
+    // sensors
+    sensors.begin();
+    numberOfDevices = sensors.getDeviceCount();
+
+    String countTopic = "/controller/" + hexMac + "/sensors/count";
+
+    memset(buffer,'\0',10);
+    itoa(numberOfDevices, buffer, 10);
+    pubMsg(countTopic, buffer);
+
+    for(int i = 0; i < numberOfDevices; i++) {
+
+        if(sensors.getAddress(tempDeviceAddress, i)) {
+            String dA = deviceAddressToStr(tempDeviceAddress);
+        
+            #if defined(MY_DEBUG)
+            Serial.print("found sensor ");
+            Serial.print(i, DEC);
+            Serial.print(" with address: ");
+            Serial.println(dA);
+            #endif
+
+            String sensorTopic = "/controller/" + hexMac + "/sensors/discovery";
+            pubMsg(sensorTopic, dA);
+        }
     }
-  }
+}
 
-  String helloTopic = "/controller/" + hexMac + "/startup";
-  
-  char buffer[10];
-  memset(buffer,'\0',10);
-  ltoa(now(), buffer, 10);
- 
-  pubMsg(helloTopic, buffer);
+void startEthernet(IPAddress ip) {
+    Ethernet.begin(mac, ip);
+    delay(5000);
+}
+
+void startMqtt() {
+    String clientId = "sc" + hexMac;
+    int clientIdLen = clientId.length() + 1;
+    char clientIdArray[clientIdLen];
+    clientId.toCharArray(clientIdArray, clientIdLen);
+
+    if (!mqttClient.connect(clientIdArray)) {
+        // no point in carrying on, so do nothing forevermore:
+        while (1) {
+            Serial.println("failed to connect MQTT server");
+            delay(10000);
+        }
+    }
     
-  String incomingTopic = "/controller/" + hexMac + "/incoming";
-  subTopic(incomingTopic);
-  
-  // sensors
-  sensors.begin();
-  numberOfDevices = sensors.getDeviceCount();
-  
-  String countTopic = "/controller/" + hexMac + "/sensors/count";
-  
-  memset(buffer,'\0',10);
-  itoa(numberOfDevices, buffer, 10);
-  pubMsg(countTopic, buffer);
-  
-  for(int i = 0; i < numberOfDevices; i++) {
-    if(sensors.getAddress(tempDeviceAddress, i)) {
-      
-      Serial.print("found sensor ");
-      Serial.print(i, DEC);
-      Serial.print(" with address: ");
-      String dA = deviceAddressToStr(tempDeviceAddress);
-      Serial.println(dA);
-		
-      //Serial.print(" setting resolution to ");
-      //Serial.println(TEMPERATURE_PRECISION, DEC);
-		
-      //sensors.setResolution(tempDeviceAddress, TEMPERATURE_PRECISION);
-      
-      String sensorTopic = "/controller/" + hexMac + "/sensors/discovery";
-      pubMsg(sensorTopic, dA);
-    }
-  }
+    String incomingTopic = "/controller/" + hexMac + "/cmd";
+    subTopic(incomingTopic);
 }
 
 time_t lastUpdate = 0;
-
 void loop() {
-  timeStatus_t tStatus = timeStatus();
-  if (timeStatus() != timeSet ) {
-    Serial.println("time not set");
-    return;
-  }
-  time_t time = now();
-  if (time - lastUpdate > UPDATE_INTERVAL) {
-    sensors.requestTemperatures();
-    Serial.print("timestamp: ");
-    Serial.println(time);
-    for (int i = 0; i < numberOfDevices; i++) {
-      if(sensors.getAddress(tempDeviceAddress, i)) {
-        float temp = sensors.getTempC(tempDeviceAddress);
-        String deviceAddress = deviceAddressToStr(tempDeviceAddress);
-        
-        Serial.print(" sensor: ");
-        Serial.print(deviceAddress);
-        Serial.print(" tmp: ");
-        Serial.print(temp);
-        Serial.println();
+    // TODO: what to do if time is wrong
+    //timeStatus_t tStatus = timeStatus();
+    //if (timeStatus() != timeSet ) {
+    //    Serial.println("time not set");
+    //    return;
+    //}
 
-        String tempTopic = "/controller/" + hexMac + "/sensor/" + deviceAddress + "/temp";
-        
-        char tempChar[10];
-        memset(tempChar,'\0',10);
-        dtostrf(temp, 4, 2, tempChar);
+    time_t time = now();
+    if (time - lastUpdate >= updateInterval) {
+    #if defined(MY_DEBUG)
+        Serial.print("update interval: ");
+        Serial.println(updateInterval);
+    #endif
+        sensors.requestTemperatures();
+    #if defined(MY_DEBUG)
+        Serial.print("timestamp: ");
+        Serial.println(time);
+    #endif
+        for (int i = 0; i < numberOfDevices; i++) {
+            if(sensors.getAddress(tempDeviceAddress, i)) {
+                String deviceAddress = deviceAddressToStr(tempDeviceAddress);
+                float temp = sensors.getTempC(tempDeviceAddress);
 
-        char timeChar[10];
-        memset(timeChar,'\0',10);
-        ltoa(now(), timeChar, 10);
+        #if defined(MY_DEBUG)
+                Serial.print(" sensor: ");
+                Serial.print(deviceAddress);
+                Serial.print(" tmp: ");
+                Serial.print(temp);
+                Serial.println();
+        #endif
 
-        String tempMsg = String(timeChar) + "," + tempChar;
+                String tempTopic = "/controller/" + hexMac + "/sensor/" + deviceAddress + "/tmp";
 
-        pubMsg(tempTopic, tempMsg);
-      }
+                char tempChar[10];
+                memset(tempChar,'\0',10);
+                dtostrf(temp, 5, 2, tempChar);
+
+                char timeChar[11];
+                memset(timeChar,'\0',11);
+                ultoa((unsigned long)time, timeChar, 10);
+
+                String tempMsg = String(timeChar) + "," + tempChar;
+
+                pubMsg(tempTopic, tempMsg);
+            }
+        }
+        lastUpdate = time;
     }
-    lastUpdate = time;
-  }
-  mqttClient.loop();
+    mqttClient.loop();
 }
 
 void pubMsg(String topic, String msg) {
@@ -185,7 +209,7 @@ void pubMsg(String topic, String msg) {
     msg.toCharArray(msgArray, msgLen);
     
     if (!mqttClient.publish(topicArray, msgArray)) {
-      Serial.println("publishing failed");
+        Serial.println("publishing failed");
     }
 }
 
@@ -193,55 +217,151 @@ void subTopic(String topic) {
     int topicLen = topic.length() + 1;
     char topicArray[topicLen];
     topic.toCharArray(topicArray, topicLen);
-    
+
     if (!mqttClient.subscribe(topicArray)) {
-      Serial.println("subscription failed");
+        Serial.println("subscription failed");
     }
 }
 
 String byteArrayToHexStr(byte* a, int len) {
-  String str = "";
-  for (int i = 0; i < len; i++) {
-    if (a[i] < 16) str.concat(String("0"));
-    str.concat(String(a[i], HEX));
-  }
-  return str;
+    String str = "";
+    for (int i = 0; i < len; i++) {
+        if (a[i] < 16) str.concat(String("0"));
+        str.concat(String(a[i], HEX));
+    }
+    return str;
 }
 
 String deviceAddressToStr(DeviceAddress deviceAddress) {
-  String str = ""; 
-  for (uint8_t i = 0; i < 8; i++)
-  {
-    if (deviceAddress[i] < 16) str.concat(String("0"));
-    str.concat(String(deviceAddress[i], HEX));
-  }
-  return str;
+    String str = ""; 
+    for (uint8_t i = 0; i < 8; i++)
+    {
+        if (deviceAddress[i] < 16) str.concat(String("0"));
+        str.concat(String(deviceAddress[i], HEX));
+    }
+    return str;
 } 
 
-// Callback function
 void callback(char* topic, byte* payload, unsigned int length) {
-  int i;
-  char* message = new char[length];
-  for(i = 0; i < length; i++) {
-     message[i] = payload[i]; 
-  }
-  message[i] = '\0';
-  
-  Serial.print("topic: ");
-  Serial.println(topic);
-  Serial.print("payload: ");
-  Serial.println(message);
+    int i;
+    char message[length + 1];
+    for(i = 0; i < length; i++) {
+        message[i] = payload[i]; 
+    }
+    message[i] = '\0';
+
+  #if defined(MY_DEBUG)
+    Serial.print("topic: ");
+    Serial.println(topic);
+    Serial.print("payload: ");
+    Serial.println(message);
+  #endif
+    
+    int cmd = 0;
+    char* arg = NULL;
+    char* ptr = strchr(message, ',');
+    if (ptr != NULL) {
+      int pos = ptr - message;
+      char cmdString[(pos + 1)];
+      strncpy(cmdString, message, pos);
+      cmdString[pos] = '\0';
+      cmd = atoi(cmdString);
+      
+      int argLen = strlen((ptr + 1));
+      arg = new char[argLen];
+      strncpy(arg, (ptr + 1), argLen);
+      arg[argLen] = '\0';
+    } else {
+      cmd = atoi(message);
+    }
+
+    Serial.print("cmd: ");
+    Serial.println(cmd);
+    Serial.print("arg: ");
+    Serial.println(arg);
+
+    switch (cmd) {
+        case CMD_GET_IP: {
+              char buffer[16];
+              ipAddressToString(Ethernet.localIP(), buffer);
+              pubMsg("/controller/" + hexMac + "/ip", buffer);
+            }
+            break;
+        case CMD_SET_IP: {
+              if (arg != NULL) {
+                IPAddress ip;
+                if (stringToIpAddress(arg, ip) == 1) {
+                  mqttClient.disconnect();
+                  Udp.stop();
+                  startEthernet(ip);
+                  Udp.begin(localPort);
+                  startMqtt();
+                }
+              }
+            }
+            break;
+        case CMD_GET_UPDATE_INTERVAL: {
+              char buffer[11];
+              memset(buffer,'\0',10);
+              itoa(updateInterval, buffer, 10);
+              pubMsg("/controller/" + hexMac + "/interval", buffer);
+            }
+            break;
+        case CMD_SET_UPDATE_INTERVAL:
+            if (arg != NULL) {
+              setUpdateInterval(atoi(arg));
+            }
+            break;
+        case CMD_GET_NTP_SERVER: {
+              char buffer[16];
+              ipAddressToString(timeServer, buffer);
+              pubMsg("/controller/" + hexMac + "/ntp", buffer);
+            }
+            break;
+        case CMD_SET_NTP_SERVER:
+            if (arg != NULL) {
+              IPAddress ip;
+              if (stringToIpAddress(arg, ip) == 1) {
+                timeServer = ip;
+              }
+            }
+            break;
+        default: 
+            Serial.print("unknown command: ");
+            Serial.println(cmd);
+    }
+    
+    if (arg != NULL) {
+      delete arg;
+    }
+}
+
+int ipAddressToString(IPAddress ip, char* ipAsString) {
+  return sprintf(ipAsString, "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+}
+
+int stringToIpAddress(char* ipAsString, IPAddress &ip) {
+  DNSClient dnsClient;
+  return dnsClient.inet_aton(ipAsString, ip);
+}
+
+void setUpdateInterval(int newInterval) {
+    if (newInterval >= 5 && newInterval < 86400) {
+        updateInterval = newInterval;
+    }
 }
 
 time_t getNtpTime() {
   while (Udp.parsePacket() > 0) ; // discard any previously received packets
-  Serial.println(" transmit ntp request");
+  //Serial.println(" transmit ntp request");
+  //Serial.print(" ntp server: ");
+  //Serial.println(timeServer);
   sendNTPpacket(timeServer);
   uint32_t beginWait = millis();
   while (millis() - beginWait < 1500) {
     int size = Udp.parsePacket();
     if (size >= NTP_PACKET_SIZE) {
-      Serial.println(" receive ntp response");
+      //Serial.println(" receive ntp response");
       Udp.read(packetBuffer, NTP_PACKET_SIZE);  // read packet into the buffer
       unsigned long secsSince1900;
       // convert four bytes starting at location 40 to a long integer
@@ -252,7 +372,7 @@ time_t getNtpTime() {
       return secsSince1900 - 2208988800UL + timeZone * SECS_PER_HOUR;
     }
   }
-  Serial.println("No NTP Response :-(");
+  //Serial.println(" no ntp response");
   return 0; // return 0 if unable to get the time
 }
 
@@ -277,4 +397,4 @@ void sendNTPpacket(IPAddress &address)
   Udp.beginPacket(address, 123); //NTP requests are to port 123
   Udp.write(packetBuffer, NTP_PACKET_SIZE);
   Udp.endPacket();
-
+}
